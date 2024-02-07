@@ -17,12 +17,17 @@ from icecream import ic
 from torchvision import transforms
 
 convert_tensor = transforms.ToTensor()
-    
+
+# Define the ranges for t_align and t_early
+t_align_range = [200, 400, 600, 800, 1000]
+t_early_range = [200, 400, 600, 800, 1000]
+
+            
 parser = argparse.ArgumentParser()
 # load the config.
 parser.add_argument("--inf_config", type=str, default="configs/rival_variation.json")
 parser.add_argument("--img_config", type=str, default="assets/images/configs_variation.json")
-parser.add_argument("--inner_round", type=int, default=1, help="number of images per reference")
+parser.add_argument("--inner_round", type=int, default=5, help="number of images per reference")
 parser.add_argument("--exp_folder", type=str, default="out/variation_exps")
 parser.add_argument("--pretrained_model_path", type=str, default="runwayml/stable-diffusion-v1-5")
 parser.add_argument("--is_half", type=bool, default=False)
@@ -38,125 +43,136 @@ with open(args.inf_config) as openfile:
 
 scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False, steps_offset=1)
 
-################################################# Config ###################################################
 
-NUM_DDIM_STEPS = cfgs["inference"]['ddim_step']
-INVERT_STEPS = cfgs["inference"]['invert_step']
-GUIDANCE_SCALE = cfgs["inference"]['cfg']
-IS_NULL_PROMPT = cfgs["inference"]['is_null_prompt']
-T_EARLY = cfgs["inference"]['t_early']
-MAX_NUM_WORDS = 77
-device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-
-################################################# Config ###################################################
-ic(args.pretrained_model_path)
-if args.is_half:
-    dtype=torch.float16
-else:
-    dtype=torch.float32
-    
-ldm_stable = RIVALStableDiffusionPipeline.from_pretrained(
-    args.pretrained_model_path, torch_dtype=dtype
-).to(device)
-ldm_stable.scheduler = scheduler
-
-for module in ldm_stable.unet.modules():
-    if isinstance(module, CrossAttention):
-        # use a placeholder function for the original forward.
-        module.ori_forward = module.forward
-        module.cfg = attn_cfgs.copy()
-        module.init_step = 1000
-        module.step_size = module.init_step // cfgs.copy()["inference"]["ddim_step"]
-        module.t_align = module.cfg["t_align"]
-        module.editing_early_steps = args.editing_early_steps
-        module.forward = types.MethodType(new_forward, module)
+# Iterate over all combinations of t_align and t_early
+for t_align in t_align_range:
+    for t_early in t_early_range:
         
-ldm_stable.enable_model_cpu_offload()
-ldm_stable.enable_xformers_memory_efficient_attention()
+        # Use the updated config for whatever process you need
+        print(f"Trying combination: t_align={t_align}, t_early={t_early}")
 
-inversion = Inversion(ldm_stable, GUIDANCE_SCALE, NUM_DDIM_STEPS, INVERT_STEPS)
-os.makedirs(os.path.join(args.exp_folder), exist_ok=True)
+        ################################################# Config ###################################################
 
-with open(args.img_config) as f:
-    cfg = json.load(f)
-    image_exps = cfg["image_exps"]
-    image_root = cfg["image_root"]
-    prompt_postfix = cfg["prompt_postfix"]
-    neg_prompt = cfg["neg_prompt"]
-    
-for cfg_item in image_exps:
-    exp_name = cfg_item['exp_name']
-    prompt = cfg_item['prompt'] + prompt_postfix
-    
-    if args.is_editing:
-        prompt_ori = cfg_item['prompt_ori']
-        prompt_edit = cfg_item['prompt']
-        
-    image_path = os.path.join(image_root, cfg_item['image_path'])
-    prompts = [prompt]
-    ic(prompt)
-        
-    if IS_NULL_PROMPT:
-        prompt = ""
-    elif args.is_editing:
-        prompt = prompt_ori
-        
-    inversion.init_prompt(prompt)  
-    image_gt = load_512(image_path)
-    rec_, x_ts = inversion.ddim_inversion(image_gt, dtype=dtype)
-    x_t = x_ts[-1]
-    png_name = os.path.join(args.exp_folder, exp_name + '.png')
-    
-    generator = torch.Generator(device=device)
+        cfgs["inference"]['t_early'] = t_early
+        cfgs["inference"]['t_align'] = t_align
 
-    if IS_NULL_PROMPT:
-        prompts = ["", prompts[0]]
-        if args.is_editing:
-            prompts = ["", prompt_edit]
-    else:
-        prompts = [prompts[0], prompts[0]]
-        if args.is_editing:
-            prompts = [prompt_ori, prompt_edit]
-            
-    # check whether use inpainting:
-    mask = None
-    if 'mask_path' in cfg_item:
-        mask_path = os.path.join(image_root, cfg_item['mask_path'])
-        mask = Image.open(mask_path).convert("L")
-        mask = mask.resize((64, 64), resample=Image.LANCZOS)
-        # convert to PIL image to binary mode
-        mask = mask.point(lambda x: 0 if x < 128 else 255, '1')
-        mask = convert_tensor(mask)[0]
-        
-    for m in range(args.inner_round):
-        if args.is_editing:
-            x_t_in = torch.cat([x_t, x_t], dim=0)
+        NUM_DDIM_STEPS = cfgs["inference"]['ddim_step']
+        INVERT_STEPS = cfgs["inference"]['invert_step']
+        GUIDANCE_SCALE = cfgs["inference"]['cfg']
+        IS_NULL_PROMPT = cfgs["inference"]['is_null_prompt']
+        T_EARLY = t_early #cfgs["inference"]['t_early']
+        MAX_NUM_WORDS = 77
+        device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+
+        ################################################# Config ###################################################
+        ic(args.pretrained_model_path)
+        if args.is_half:
+            dtype=torch.float16
         else:
-            idx = torch.randperm(x_t.nelement()//4)
-            x_t_append_norm = x_t.view(1, 4, -1)[:, :, idx].view(x_t.size())
-            x_t_in = torch.cat([x_t, x_t_append_norm], dim=0)
-        
-        # for inpainting.
-        if mask is not None:
-            masked_latent = x_t.clone()[:, :, mask == 0].view(1, 4, -1) 
-            idx = torch.randperm(masked_latent.nelement()//4)
-            masked_latent = masked_latent[:, :, idx].view(masked_latent.size())
-            x_t_in[1, :, mask == 0] = masked_latent
-        
-        with torch.no_grad():
-            images = ldm_stable(
-                prompts,
-                negative_prompt=["", neg_prompt],
-                generator=generator,
-                latents=x_t_in,
-                num_images_per_prompt=1,
-                num_inference_steps = NUM_DDIM_STEPS,
-                guidance_scale = GUIDANCE_SCALE,
-                is_adain = True,
-                chain = x_ts,
-                t_early = T_EARLY,
-                output_type = 'np',
-                inpaint_mask = mask,
-            ).images
-        
-        utils.save_images([images[1]*255], name=png_name[:-4] + f"_{m}.png", offset_ratio=0.0)
+            dtype=torch.float32
+            
+        ldm_stable = RIVALStableDiffusionPipeline.from_pretrained(
+            args.pretrained_model_path, torch_dtype=dtype
+        ).to(device)
+        ldm_stable.scheduler = scheduler
+
+        for module in ldm_stable.unet.modules():
+            if isinstance(module, CrossAttention):
+                # use a placeholder function for the original forward.
+                module.ori_forward = module.forward
+                module.cfg = attn_cfgs.copy()
+                module.init_step = 1000
+                module.step_size = module.init_step // cfgs.copy()["inference"]["ddim_step"]
+                module.t_align = module.cfg["t_align"]
+                module.editing_early_steps = args.editing_early_steps
+                module.forward = types.MethodType(new_forward, module)
+                
+        ldm_stable.enable_model_cpu_offload()
+        ldm_stable.enable_xformers_memory_efficient_attention()
+
+        inversion = Inversion(ldm_stable, GUIDANCE_SCALE, NUM_DDIM_STEPS, INVERT_STEPS)
+        os.makedirs(os.path.join(args.exp_folder), exist_ok=True)
+
+        with open(args.img_config) as f:
+            cfg = json.load(f)
+            image_exps = cfg["image_exps"]
+            image_root = cfg["image_root"]
+            prompt_postfix = cfg["prompt_postfix"]
+            neg_prompt = cfg["neg_prompt"]
+            
+        for cfg_item in image_exps:
+            exp_name = cfg_item['exp_name']
+            prompt = cfg_item['prompt'] + prompt_postfix
+            
+            if args.is_editing:
+                prompt_ori = cfg_item['prompt_ori']
+                prompt_edit = cfg_item['prompt']
+                
+            image_path = os.path.join(image_root, cfg_item['image_path'])
+            prompts = [prompt]
+            ic(prompt)
+                
+            if IS_NULL_PROMPT:
+                prompt = ""
+            elif args.is_editing:
+                prompt = prompt_ori
+                
+            inversion.init_prompt(prompt)  
+            image_gt = load_512(image_path)
+            rec_, x_ts = inversion.ddim_inversion(image_gt, dtype=dtype)
+            x_t = x_ts[-1]
+            png_name = os.path.join(args.exp_folder, exp_name + '.png')
+            
+            generator = torch.cuda.manual_seed(32)
+
+            if IS_NULL_PROMPT:
+                prompts = ["", prompts[0]]
+                if args.is_editing:
+                    prompts = ["", prompt_edit]
+            else:
+                prompts = [prompts[0], prompts[0]]
+                if args.is_editing:
+                    prompts = [prompt_ori, prompt_edit]
+                    
+            # check whether use inpainting:
+            mask = None
+            if 'mask_path' in cfg_item:
+                mask_path = os.path.join(image_root, cfg_item['mask_path'])
+                mask = Image.open(mask_path).convert("L")
+                mask = mask.resize((64, 64), resample=Image.LANCZOS)
+                # convert to PIL image to binary mode
+                mask = mask.point(lambda x: 0 if x < 128 else 255, '1')
+                mask = convert_tensor(mask)[0]
+                
+            for m in range(args.inner_round):
+                if args.is_editing:
+                    x_t_in = torch.cat([x_t, x_t], dim=0)
+                else:
+                    idx = torch.randperm(x_t.nelement()//4)
+                    x_t_append_norm = x_t.view(1, 4, -1)[:, :, idx].view(x_t.size())
+                    x_t_in = torch.cat([x_t, x_t_append_norm], dim=0)
+                
+                # for inpainting.
+                if mask is not None:
+                    masked_latent = x_t.clone()[:, :, mask == 0].view(1, 4, -1) 
+                    idx = torch.randperm(masked_latent.nelement()//4)
+                    masked_latent = masked_latent[:, :, idx].view(masked_latent.size())
+                    x_t_in[1, :, mask == 0] = masked_latent
+                
+                with torch.no_grad():
+                    images = ldm_stable(
+                        prompts,
+                        negative_prompt=["", neg_prompt],
+                        generator=generator,
+                        latents=x_t_in,
+                        num_images_per_prompt=1,
+                        num_inference_steps = NUM_DDIM_STEPS,
+                        guidance_scale = GUIDANCE_SCALE,
+                        is_adain = True,
+                        chain = x_ts,
+                        t_early = T_EARLY,
+                        output_type = 'np',
+                        inpaint_mask = mask,
+                    ).images
+                
+                utils.save_images([images[1]*255], name=png_name[:-4] + f"_{m}_t_early_{t_early}_t_align_{t_align}.png", offset_ratio=0.0)
